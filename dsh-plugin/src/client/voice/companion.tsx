@@ -26,7 +26,7 @@ import type { CSSProperties } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: pulls ui-conversation's SlotMap merge for PropsRuntime resolution.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { bridgeBase, dhStatus, dhDiscard, tts, type DhStatus } from '../bridge.ts'
+import { bridgeBase, dhStatus, dhDiscard, tts, readVoiceEnabled, type DhStatus } from '../bridge.ts'
 import { readDigitalHuman } from '../DigitalHumanToggle.tsx'
 import type { VoiceInjected } from '../contract.ts'
 import css from './CompanionWindow.module.css'
@@ -141,6 +141,88 @@ const VIDEO_STYLE: CSSProperties = {
   objectFit: 'cover',
   transition: 'opacity 0.8s ease',
   opacity: 0,
+}
+
+/** 卡片左下角的分段进度浮层（分段 TTS 是逐段提交给 DUIX 的）。 */
+const DH_SEG_STYLE: CSSProperties = {
+  position: 'absolute',
+  left: 12,
+  bottom: 12,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 5,
+  minWidth: 132,
+  maxWidth: '62%',
+  padding: '7px 11px',
+  borderRadius: 12,
+  background: 'rgba(10,11,16,0.74)',
+  color: 'rgba(255,255,255,0.9)',
+  fontSize: 12,
+  lineHeight: 1.2,
+  letterSpacing: '0.02em',
+  whiteSpace: 'nowrap',
+  pointerEvents: 'none',
+  zIndex: 6,
+  backdropFilter: 'blur(6px)',
+}
+
+const DH_SEG_BAR_STYLE: CSSProperties = {
+  display: 'block',
+  height: 3,
+  borderRadius: 999,
+  background: 'rgba(255,255,255,0.18)',
+  overflow: 'hidden',
+}
+
+const DH_SEG_FILL_STYLE: CSSProperties = {
+  display: 'block',
+  height: '100%',
+  borderRadius: 999,
+  background: 'rgba(255,255,255,0.88)',
+  transition: 'width 0.4s ease',
+}
+
+/** 语音总开关关着时的提示（整条回复管道的总闸，数字人也跟着不提交）。 */
+const DH_HINT_STYLE: CSSProperties = {
+  position: 'absolute',
+  left: 12,
+  bottom: 12,
+  maxWidth: '62%',
+  padding: '7px 11px',
+  borderRadius: 12,
+  background: 'rgba(120,72,8,0.82)',
+  color: '#fde68a',
+  fontSize: 12,
+  lineHeight: 1.2,
+  whiteSpace: 'nowrap',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  pointerEvents: 'none',
+  zIndex: 7,
+  backdropFilter: 'blur(6px)',
+}
+
+/**
+ * 数字人分段进度一行文案：分段 TTS 逐段提交给 DUIX（段 N 生成时预合成段 N+1），
+ * 所以桥接能给出确切的总段数/已完成段数——一眼看出还差几段，而不是干等。
+ */
+function dhSegText(dh: DhStatus): string {
+  const total = dh.total_segments || 0
+  const done = dh.done_segments || 0
+  if (dh.state === 'done') {
+    const n = total || done
+    return `数字人 · ${n}/${n} 段 已完成`
+  }
+  if (dh.state === 'error') return `数字人 · 失败：${dh.message || '生成出错'}`
+  if (dh.state === 'discarded') return '数字人 · 已取消'
+  if (total > 0) {
+    const current = Math.min(done + 1, total)
+    const phase = dh.state === 'tts' ? ' 语音合成' : dh.state === 'generating' ? ' 生成中' : ''
+    const extra = dh.pending > 0 ? `（排队 ${dh.pending}）` : ''
+    return `数字人 · 第 ${current}/${total} 段${phase}${extra}`
+  }
+  if (dh.duix?.state === 'starting') return '数字人 · DUIX 容器启动中…'
+  return dh.message || '数字人生成中…'
 }
 
 /**
@@ -723,10 +805,27 @@ export const CompanionWindow = memo(function CompanionWindow({ speaker, companio
       <video ref={taskRef} style={VIDEO_STYLE} muted playsInline preload="metadata" draggable={false} onEnded={onTaskEnded} />
       {/* Digital-human frame (load on demand, carries the TTS audio) */}
       <video ref={dhRef} style={VIDEO_STYLE} playsInline preload="metadata" draggable={false} onEnded={onDhEnded} />
-      {dhBusy && readDigitalHuman() && (
-        <div className={css.dhCaption}>
-          {dh.state === 'tts' ? '语音合成中…' : dh.message || '数字人生成中…'}
+      {/* 分段进度（左下角）：分段 TTS 逐段提交，显示「第 N/M 段」。
+          旧的 dhCaption（右下角，显示桥接 message）已删——信息重复会重叠。 */}
+      {readDigitalHuman() && dh !== null
+        && (dhBusy || dhPlaying || dh.state === 'error' || dh.state === 'discarded') && (
+        <div style={DH_SEG_STYLE}>
+          <span style={{ fontVariantNumeric: 'tabular-nums' }}>{dhSegText(dh)}</span>
+          {dh.total_segments > 0 && (
+            <span style={DH_SEG_BAR_STYLE}>
+              <i
+                style={{
+                  ...DH_SEG_FILL_STYLE,
+                  width: `${Math.round((Math.min(dh.done_segments, dh.total_segments) / dh.total_segments) * 100)}%`,
+                }}
+              />
+            </span>
+          )}
         </div>
+      )}
+      {/* 语音总开关关着：整条管道都不提交，明确提示 */}
+      {readDigitalHuman() && !readVoiceEnabled() && (
+        <div style={DH_HINT_STYLE}>语音总开关关着 · 数字人不会提交</div>
       )}
       {/* Resize handle (bottom-right corner) */}
       <div

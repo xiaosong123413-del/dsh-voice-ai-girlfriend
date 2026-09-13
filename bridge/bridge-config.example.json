@@ -57,7 +57,11 @@
     "segment_chars": 48,
     "submit_retry_sec": 5,
     "query_interval_sec": 2,
-    "query_timeout_sec": 240
+    "query_timeout_sec": 240,
+    "submit_conn_fails": 6,
+    "container_name": "duix-avatar-gen-video",
+    "docker_cli": "docker",
+    "stop_container_on_disable": true
   },
   "omnivoice": {
     "base": "http://<WSL2-IP>:9877",

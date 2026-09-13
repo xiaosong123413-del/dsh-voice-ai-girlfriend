@@ -15,6 +15,21 @@ export function bridgeBase(): string {
   }
 }
 
+/**
+ * 语音总开关（composer 上的喇叭按钮，localStorage `s2s.voice.enabled`）。
+ *
+ * ⚠️ 它是整条回复管道的总闸：关掉时 reply-listener 直接 return，逐句 TTS 与
+ * 数字人提交**都不会发生**（数字人本质是「用视频代替朗读」，所以跟着总闸走）。
+ * 界面据此给出提示，避免「我开了数字人怎么没反应」。
+ */
+export function readVoiceEnabled(): boolean {
+  try {
+    return localStorage.getItem('s2s.voice.enabled') !== '0'
+  } catch {
+    return true
+  }
+}
+
 /** Speech to text: raw 16 kHz mono PCM16 -> { text, language }. */
 export async function stt(pcm16: ArrayBuffer): Promise<{ text: string; language?: string }> {
   const resp = await fetch(`${bridgeBase()}/api/stt`, {
@@ -113,6 +128,42 @@ export async function dhStatus(): Promise<DhStatus | null> {
     return resp.json() as Promise<DhStatus>
   } catch {
     return null
+  }
+}
+
+/**
+ * Flip the BRIDGE-side digital-human switch (runtime, persisted in the bridge's
+ * bridge-config.json). Turning it off makes the bridge stop for real: no queue
+ * worker, no startup warmup, no DUIX submit/probe traffic at all — the TTS path
+ * keeps working. Turning it on starts the worker + warmup.
+ * Resolves with the bridge's resulting state (null when unreachable).
+ */
+export async function dhEnable(enabled: boolean): Promise<boolean | null> {
+  try {
+    const resp = await fetch(`${bridgeBase()}/api/dh/enable`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    })
+    if (!resp.ok) return null
+    const json = (await resp.json()) as { enabled?: boolean }
+    return json.enabled ?? null
+  } catch (err) {
+    console.error('[ui-voice] digital human switch failed:', err)
+    return null
+  }
+}
+
+/** Window event fired after the local DH toggle changes (or syncs on mount):
+ *  listeners re-read the bridge switch so flipping it takes effect immediately. */
+export const DH_CHANGE_EVENT = 'dsh-voice:dh-change'
+
+/** Announce a DH toggle change to the rest of the plugin. */
+export function notifyDhChanged(): void {
+  try {
+    window.dispatchEvent(new Event(DH_CHANGE_EVENT))
+  } catch {
+    // no window (non-browser context) — nothing to notify
   }
 }
 

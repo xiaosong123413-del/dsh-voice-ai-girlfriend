@@ -24,6 +24,7 @@ import io
 import json
 import logging
 import os
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -46,6 +47,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("voice_bridge")
 
+# 日志同时落盘：桥接平时跑在自己的控制台窗口里，窗口一关/没看着就无法回看，
+# 「任务到底提交了没有、失败在哪一步」只能靠猜。这里额外挂一个轮转文件日志
+# （logs/bridge.log, 4MB × 4）。写盘失败只告警，不影响服务。
+try:
+    from logging.handlers import RotatingFileHandler
+
+    _log_dir = HERE / "logs"
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    _file_handler = RotatingFileHandler(
+        _log_dir / "bridge.log", maxBytes=4 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    _file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    logging.getLogger().addHandler(_file_handler)
+    logger.info("bridge log file -> %s", _log_dir / "bridge.log")
+except Exception:  # noqa: BLE001
+    logger.exception("bridge log file setup failed (console logging continues)")
+
 
 def load_config() -> dict:
     # utf-8-sig 容忍 BOM（某些工具如 PowerShell 5.1 Set-Content 会写 BOM）
@@ -59,6 +79,7 @@ app = FastAPI(title="voice-bridge")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CONFIG.get("cors_origins", ["http://127.0.0.1:3080"]),
+    allow_origin_regex=r"http://(127\.0\.0\.1|localhost):\d+",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -568,7 +589,37 @@ async def media_bg_file(name: str):
 # 回复值得生成视频）。query 查询成功/失败后任务即被服务端删除（一次性）。
 
 DH_CFG = CONFIG.get("digital_human", {})
+# ⚠️ 数字人运行时开关（2026-09-14 改）：DH_ENABLED 曾是启动时读配置的静态值，
+# 且启动就无条件开 worker + 预热；插件端把数字人关掉（localStorage
+# s2s.voice.digitalHuman=0）只让前端不再调 /api/dh/speak，桥接完全不知情——
+# DUIX 没起时预热还会对着它连续重试提交（60 次 × 5s），就是「数字人关着、
+# 桥接却一直敲 DUIX」的根因。
+# 现在：_dh_enabled 运行时可热切（POST /api/dh/enable，并持久化回
+# bridge-config.json）；关闭时 worker 空转、不预热、在途任务立即作废，桥接
+# 不产生任何 DUIX 流量，TTS 朗读链完全不受影响。
+# DH_ENABLED 仅表示「启动时的配置默认值」，运行时判断一律用 _dh_enabled()。
 DH_ENABLED = bool(DH_CFG.get("enabled", False))
+_dh_enabled: bool = DH_ENABLED
+
+
+def _dh_enabled_now() -> bool:
+    """当前数字人开关状态（运行时可热切，见 POST /api/dh/enable）。"""
+    return _dh_enabled
+
+
+def _persist_dh_enabled(enabled: bool) -> None:
+    """把开关写回 bridge-config.json（写入失败只告警，不影响本次运行）。"""
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        raw.setdefault("digital_human", {})["enabled"] = bool(enabled)
+        CONFIG_PATH.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        logger.info("DH switch persisted: digital_human.enabled=%s", enabled)
+    except Exception:  # noqa: BLE001
+        logger.exception("DH switch persist failed (runtime value still applied)")
+
+
 DH_DUIX_BASE = DH_CFG.get("duix_base", "http://127.0.0.1:8383").rstrip("/")
 DH_DATA_DIR = Path(DH_CFG.get("data_dir", "D:/duix_avatar_data/face2face"))
 DH_TEMP_DIR = DH_DATA_DIR / DH_CFG.get("temp_dir", "temp")
@@ -577,12 +628,61 @@ DH_TEMP_DIR = DH_DATA_DIR / DH_CFG.get("temp_dir", "temp")
 DH_OUTPUT_DIR = DH_TEMP_DIR / "output"
 DH_AVATAR = DH_CFG.get("avatar_video", "")
 DH_SUBMIT_RETRY_SEC = float(DH_CFG.get("submit_retry_sec", 5))
+# 连续提交失败（DUIX 连不上）多少次后判死并回退 TTS：6 × 5s ≈ 30s 宽限，
+# 够容器启动/预热用，又不会像以前那样闷头重试 15 分钟。
+DH_SUBMIT_CONN_FAILS = int(DH_CFG.get("submit_conn_fails", 6))
 DH_QUERY_INTERVAL = float(DH_CFG.get("query_interval_sec", 2))
 DH_QUERY_TIMEOUT = float(DH_CFG.get("query_timeout_sec", 240))
 DH_MAX_KEEP = int(DH_CFG.get("max_keep", 10))
 # 每段音频的文本上限：~48 字 ≈ 8~10s 音频（用户实测 10s 视频十几秒出片）
 DH_SEGMENT_CHARS = int(DH_CFG.get("segment_chars", 48))
 DH_MAX_TEXT = 1000
+
+# ── DUIX 容器生命周期（2026-09-14：关掉数字人 = 连容器一起停，把显存还回去）──
+# 以前开关只管「桥接不再提交」，DUIX 容器仍常驻占着显存（模型十几 GB）。
+# 现在关闭时顺手 docker stop 容器（release_gpu=true），打开时 docker start
+# 并等它就绪（冷启动要加载模型，1-3 分钟）再预热。
+DH_CONTAINER = str(DH_CFG.get("container_name", "duix-avatar-gen-video"))
+DH_DOCKER_CLI = str(DH_CFG.get("docker_cli", "docker"))
+DH_RELEASE_GPU = bool(DH_CFG.get("stop_container_on_disable", True))
+
+# DUIX 容器/服务状态（status 里回给插件，卡片可以显示「容器启动中…」）
+_dh_duix: dict = {"container": DH_CONTAINER, "state": "unknown", "message": "", "checked_at": 0.0}
+
+# 可观测性：以前「任务到底提交了没有」无从查证（日志只在控制台窗口里）。
+# 这些计数随 /api/dh/status 一起返回，前端/人工都能一眼确认。
+_dh_stats: dict = {
+    "submits": 0,           # /api/dh/speak 被成功受理的次数（插件真的提交了）
+    "rejected": 0,          # 被拒次数（开关关着 / 空文本）
+    "last_submit_at": 0.0,
+    "last_reject": "",
+    "segment_submits": 0,   # 真正提交给 DUIX 的段次数（分段逐批提交）
+    "status_polls": 0,      # 状态轮询次数（证明前端在连着、在轮询）
+    "last_poll_at": 0.0,
+}
+
+
+def _dh_duix_set(state: str, message: str = "") -> None:
+    _dh_duix.update({"state": state, "message": message, "checked_at": time.time()})
+
+
+def _dh_stat(key: str, delta: int = 1) -> None:
+    _dh_stats[key] = int(_dh_stats.get(key, 0)) + delta
+
+
+def _docker(args: list[str], timeout: float = 120.0) -> tuple[bool, str]:
+    """在宿主上跑一条 docker 命令（Docker Desktop）。返回 (成功, 输出摘要)。"""
+    try:
+        proc = subprocess.run(
+            [DH_DOCKER_CLI, *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except FileNotFoundError:
+        return False, f"docker CLI 不可用（{DH_DOCKER_CLI} 不在 PATH）"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+    out = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+    return proc.returncode == 0, out
 
 # ── TTS 音色预设（统一从 voices 大文件夹下子文件夹读取）────────────────────
 # 约定：VOICES_DIR（voices）下的每个【子文件夹】= 一个音色，文件夹名即音色名。
@@ -784,6 +884,9 @@ def _dh_get() -> dict:
     with _dh_lock:
         state = dict(_dh_state)
         state["pending"] = sum(1 for t in _dh_queue if not t["started"])
+        # 容器状态 + 计数（前端卡片显示「容器启动中…」，人工核对「提交了没有」）
+        state["duix"] = dict(_dh_duix)
+        state["stats"] = dict(_dh_stats)
         return state
 
 
@@ -816,10 +919,14 @@ class DHSpeakRequest(BaseModel):
 @app.post("/api/dh/speak")
 async def dh_speak(req: DHSpeakRequest) -> dict:
     """提交一段回复文本，生成数字人口播视频（后台排队，最新替换未开始任务）。"""
-    if not DH_ENABLED:
-        raise HTTPException(status_code=400, detail="digital_human disabled in bridge-config.json")
+    if not _dh_enabled_now():
+        _dh_stat("rejected")
+        _dh_stats["last_reject"] = "数字人开关关闭（/api/dh/enable {enabled:true} 可打开）"
+        raise HTTPException(status_code=400, detail="digital_human disabled (POST /api/dh/enable {enabled:true} to turn on)")
     text = (req.text or "").strip()
     if not text:
+        _dh_stat("rejected")
+        _dh_stats["last_reject"] = "空文本"
         raise HTTPException(status_code=400, detail="Empty text")
     if len(text) > DH_MAX_TEXT:
         logger.warning("DH text truncated from %d to %d chars", len(text), DH_MAX_TEXT)
@@ -831,6 +938,8 @@ async def dh_speak(req: DHSpeakRequest) -> dict:
         _dh_queue.append({"code": code, "text": text, "started": False})
         pending = sum(1 for t in _dh_queue if not t["started"])
     logger.info("DH enqueue: %s (%d chars), pending=%d", code, len(text), pending)
+    _dh_stat("submits")
+    _dh_stats["last_submit_at"] = time.time()
     return {"ok": True, "code": code}
 
 
@@ -855,7 +964,58 @@ async def dh_discard(req: DHDiscardRequest) -> dict:
 @app.get("/api/dh/status")
 async def dh_status() -> dict:
     """数字人任务状态：插件轮询；done 时带 video_url。"""
+    _dh_stat("status_polls")
+    _dh_stats["last_poll_at"] = time.time()
     return _dh_get()
+
+
+class DHEnableRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/dh/enable")
+async def dh_enable(req: DHEnableRequest) -> dict:
+    """运行时开关数字人（热切换，无需重启桥接；并持久化到 bridge-config.json）。
+
+    ON  ：起 worker、确保 DUIX 容器在跑（必要时 docker start + 等就绪）、预热
+    OFF ：清空队列 + 在途任务全部作废、状态复位、worker 空转（零 DUIX 流量），
+          并 docker stop 掉 DUIX 容器把显存还回去（release_gpu=true 时）
+    这就是插件端数字人开关的桥接侧落点：关掉=桥接停手 + 容器也停。
+    """
+    global _dh_enabled
+    enabled = bool(req.enabled)
+    with _dh_lock:
+        if enabled == _dh_enabled:
+            return {"ok": True, "enabled": _dh_enabled, "changed": False}
+        _dh_enabled = enabled
+        if not enabled:
+            # 在途 + 排队任务全部作废（结果不再播放、不再提交新段）
+            for t in _dh_queue:
+                _dh_discarded.add(t["code"])
+            _dh_queue.clear()
+            current = _dh_state.get("code") or ""
+            if current:
+                _dh_discarded.add(current)
+    # 复位状态字段（两种方向都清干净，避免插件端读到上一轮的残留视频）
+    _dh_set(
+        enabled=enabled, state="idle", message="", progress=0,
+        video_file="", video_url="", videos=[], total_segments=0,
+        done_segments=0, code="", text="",
+    )
+    if enabled:
+        DH_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        _dh_prune_videos()
+        _dh_ensure_worker()
+        # 0.1.3 级联动：先确保 DUIX 容器在跑（冷启动可能要 1-3 分钟），就绪后再预热
+        asyncio.create_task(_dh_bring_up())
+    elif DH_RELEASE_GPU:
+        # 关掉数字人 = 连容器一起停，把显存还给别的服务（如 OmniVoice / LLM）
+        asyncio.create_task(_dh_container_stop())
+    else:
+        _dh_duix_set("running", "容器保持运行（release_gpu=false）")
+    _persist_dh_enabled(enabled)
+    logger.info("DH runtime switch: %s (container stop=%s)", "ON" if enabled else "OFF", DH_RELEASE_GPU)
+    return {"ok": True, "enabled": enabled, "changed": True, "duix": dict(_dh_duix)}
 
 
 @app.get("/api/dh/history")
@@ -1105,15 +1265,40 @@ async def _dh_submit_and_wait(
         "pn": 1,
     }
     submitted = False
+    submit_fails = 0
+    max_fails = DH_SUBMIT_CONN_FAILS
     for _ in range(180):  # 最多等 15 分钟 busy 释放
+        if not _dh_enabled_now():
+            # 开关关掉：立刻停手，不再提交/占用 DUIX
+            logger.info("DH %s: aborted (digital human switched off)", seg_code)
+            return None
         try:
             resp = await _dh_submit(client, payload)
-        except Exception:  # noqa: BLE001
-            logger.exception("DH %s: submit http failed", seg_code)
+        except Exception as exc:  # noqa: BLE001
+            # DUIX 不可达（容器没起/正在冷启动）：前几次静默重试，连续失败到
+            # 阈值就判死回退 TTS。容器正在 starting/stopping 时给足宽限
+            # （冷启动要加载模型 1-3 分钟），别把正常启动误判成故障。
+            if _dh_duix.get("state") in ("starting", "stopping"):
+                max_fails = max(DH_SUBMIT_CONN_FAILS, int(240 / max(DH_SUBMIT_RETRY_SEC, 1)))
+            submit_fails += 1
+            if submit_fails == 1:
+                logger.warning(
+                    "DH %s: DUIX unreachable at %s (%s) — retrying up to %d×",
+                    seg_code, DH_DUIX_BASE, type(exc).__name__, max_fails,
+                )
+            if submit_fails >= max_fails:
+                _dh_set(
+                    state="error",
+                    message=f"DUIX 不可达（{DH_DUIX_BASE} 未响应）",
+                    code=reply_code, text=reply_text,
+                )
+                return None
             await asyncio.sleep(DH_SUBMIT_RETRY_SEC)
             continue
+        submit_fails = 0
         if resp.get("code") == 10000:
             submitted = True
+            _dh_stat("segment_submits")
             break
         if resp.get("code") == 10001:  # busy
             await asyncio.sleep(DH_SUBMIT_RETRY_SEC)
@@ -1126,6 +1311,9 @@ async def _dh_submit_and_wait(
 
     deadline = time.time() + DH_QUERY_TIMEOUT
     while time.time() < deadline:
+        if not _dh_enabled_now():
+            logger.info("DH %s: polling aborted (digital human switched off)", seg_code)
+            return None
         await asyncio.sleep(DH_QUERY_INTERVAL)
         q = await _dh_query(client, seg_code)
         if q is None:
@@ -1159,8 +1347,12 @@ async def _dh_worker() -> None:
     """后台队列 worker：串行消费 /api/dh/speak 提交的任务。
 
     完成后保留 done/error/discarded 状态（含 video_url），供插件取用；
-    新任务开始时才清空旧结果（见 _dh_run 开头）。"""
+    新任务开始时才清空旧结果（见 _dh_run 开头）。
+    数字人开关关闭时空转（不消费队列、不碰 DUIX）——开关一关，桥接零 DUIX 流量。"""
     while True:
+        if not _dh_enabled_now():
+            await asyncio.sleep(1.0)
+            continue
         item = _dh_pop_next()
         if item is None:
             await asyncio.sleep(1.0)
@@ -1172,16 +1364,92 @@ async def _dh_worker() -> None:
             _dh_set(state="error", message="worker 异常", code=item.get("code", ""), text=item.get("text", ""))
 
 
+_dh_worker_task: "asyncio.Task | None" = None
+
+
+def _dh_ensure_worker() -> None:
+    """确保 worker 在跑（运行时可反复开关，重复调用安全）。"""
+    global _dh_worker_task
+    if _dh_worker_task is None or _dh_worker_task.done():
+        _dh_worker_task = asyncio.create_task(_dh_worker())
+        logger.info("DH worker started")
+
+
+async def _dh_reachable(timeout: float = 3.0) -> bool:
+    """DUIX 是否可达：GET /easy/query 探活（容器没起时立刻 False，不重试）。"""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(f"{DH_DUIX_BASE}/easy/query", params={"code": "probe"})
+            return resp.status_code < 500
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _dh_container_stop() -> None:
+    """停掉 DUIX 容器，把显存真的还回去（关数字人 = 连 GPU 一起放）。"""
+    _dh_duix_set("stopping", "正在停止 DUIX 容器…")
+    ok, out = await asyncio.to_thread(_docker, ["stop", DH_CONTAINER], 180)
+    if ok:
+        _dh_duix_set("stopped", "DUIX 已停止，显存已释放")
+        logger.info("DH container stopped (%s): %s", DH_CONTAINER, out)
+    else:
+        _dh_duix_set("unknown", f"停止容器失败: {out[:160]}")
+        logger.warning("DH container stop failed: %s", out)
+
+
+async def _dh_wait_duix_ready(timeout: float = 240.0) -> bool:
+    """等 DUIX 真的能应答（冷启动要加载模型，可能 1-3 分钟）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _dh_enabled_now():
+            return False
+        if await _dh_reachable():
+            return True
+        await asyncio.sleep(3)
+    return False
+
+
+async def _dh_container_start() -> None:
+    """启动 DUIX 容器并等它就绪；失败/超时只更新状态，不阻塞其它功能。"""
+    _dh_duix_set("starting", "正在启动 DUIX 容器…")
+    ok, out = await asyncio.to_thread(_docker, ["start", DH_CONTAINER], 120)
+    if not ok:
+        _dh_duix_set("unavailable", f"启动容器失败: {out[:160]}")
+        logger.warning("DH container start failed: %s", out)
+        return
+    logger.info("DH container starting (%s)…", DH_CONTAINER)
+    if await _dh_wait_duix_ready():
+        _dh_duix_set("running", "DUIX 就绪")
+        logger.info("DH container ready at %s", DH_DUIX_BASE)
+    else:
+        _dh_duix_set("unavailable", "DUIX 容器未在超时内就绪")
+        logger.warning("DH container did not become ready in time")
+
+
+async def _dh_bring_up() -> None:
+    """打开数字人：确保容器在跑 → 真正就绪后再预热。"""
+    if not _dh_enabled_now():
+        return
+    if await _dh_reachable():
+        _dh_duix_set("running", "DUIX 就绪")
+    else:
+        await _dh_container_start()
+    if _dh_enabled_now() and _dh_duix.get("state") == "running":
+        await _dh_warmup()
+
+
 @app.on_event("startup")
 async def _dh_start_worker() -> None:
-    if DH_ENABLED:
+    if _dh_enabled_now():
         _dh_prune_videos()  # 启动时把成品视频修剪到最近 max_keep 个
-        asyncio.create_task(_dh_worker())
-        # 启动预热：合成一段短音频并提交 DUIX，让 wenet 特征提取 / init_wh /
-        # 模型加载 / TRT engine 全部走一遍热路径，首条真实回复的等待时间
-        # 显著缩短。预热任务独立于 _dh_queue 运行，结果直接丢弃。
-        asyncio.create_task(_dh_warmup())
-        logger.info("DH worker started (DUIX %s, temp=%s, avatar=%s, max_keep=%d)", DH_DUIX_BASE, DH_TEMP_DIR, DH_AVATAR, DH_MAX_KEEP)
+        _dh_ensure_worker()
+        # 预热前先确保容器在跑（DUIX 不可达时预热会直接跳过，不再空转重试）；
+        # 预热让 wenet 特征提取 / init_wh / 模型加载 / TRT engine 走一遍热路径，
+        # 首条真实回复的等待时间显著缩短。预热独立于 _dh_queue，结果直接丢弃。
+        asyncio.create_task(_dh_bring_up())
+        logger.info("DH worker started (DUIX %s, container=%s, temp=%s, avatar=%s, max_keep=%d)", DH_DUIX_BASE, DH_CONTAINER, DH_TEMP_DIR, DH_AVATAR, DH_MAX_KEEP)
+    else:
+        logger.info("DH disabled — no worker, no warmup, zero DUIX traffic")
 
 
 async def _dh_warmup() -> None:
@@ -1189,8 +1457,14 @@ async def _dh_warmup() -> None:
 
     预热输出是「数字人没有说话」的占位短句（或仅预合成音频 + 提交），
     完成即删，不进入播放列表、不污染 max_keep 历史。
-    """
+    DUIX 不可达时直接跳过（旧版会在这里对着空气重试 60×5s，是「关着数字人
+    还一直敲 DUIX」的元凶之一）。"""
     try:
+        if not _dh_enabled_now():
+            return
+        if not await _dh_reachable():
+            logger.info("DH warmup skipped: DUIX unreachable at %s", DH_DUIX_BASE)
+            return
         logger.info("DH warmup: synthesizing warmup audio…")
         wav = await _dh_synth_segment("数字人系统预热完成")
         code = f"warmup-{uuid4()}"
@@ -1205,12 +1479,25 @@ async def _dh_warmup() -> None:
         }
         async with httpx.AsyncClient(timeout=20) as client:
             # 预热不写 _dh_state：直接提交 + 轮询，完成即删，失败静默。
+            warm_fails = 0
             for _ in range(60):  # 最多等 5 分钟 busy 释放
+                if not _dh_enabled_now():
+                    logger.info("DH warmup: aborted (switched off)")
+                    wav.unlink(missing_ok=True)
+                    return
                 try:
                     resp = await _dh_submit(client, payload)
                 except Exception:  # noqa: BLE001
+                    # DUIX 掉线：连续失败到阈值就放弃预热（旧版在这里闷头重试
+                    # 5 分钟，每次都是一条到 :9000 的连接尝试 → 日志/连接刷屏）
+                    warm_fails += 1
+                    if warm_fails >= DH_SUBMIT_CONN_FAILS:
+                        logger.warning("DH warmup: DUIX unreachable, skipping warmup")
+                        wav.unlink(missing_ok=True)
+                        return
                     await asyncio.sleep(DH_SUBMIT_RETRY_SEC)
                     continue
+                warm_fails = 0
                 if resp.get("code") == 10000:
                     break
                 if resp.get("code") == 10001:  # busy（真实任务在跑，跳过预热）
@@ -1247,7 +1534,9 @@ async def _dh_warmup() -> None:
 
 # 结果视频静态挂载：插件 video 元素直接播 /media/dh/<uuid>-r.mp4（Range 支持）。
 # 产物统一在 output 子目录（与形象素材分离）。
-if DH_ENABLED and DH_TEMP_DIR.is_dir():
+# 注意：不按 DH_ENABLED 门控 —— 开关现在是运行时可切的，若这里跳过挂载，
+# 之后再把数字人打开时 /media/dh 会 404（视频生成了却播不出来）。
+if DH_TEMP_DIR.is_dir():
     DH_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     app.mount("/media/dh", StaticFiles(directory=str(DH_OUTPUT_DIR)), name="media-dh")
 

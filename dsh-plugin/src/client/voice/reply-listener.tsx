@@ -21,7 +21,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 // Type-only: pulls ui-chat's `useChat` into SessionStandardProps (0.1.3).
 import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { AssistantChatData } from '@deepseek-ai/dsh-client-ui-chat/client'
-import { tts, dhSpeak, dhStatus, dhDiscard } from '../bridge.ts'
+import { tts, dhSpeak, dhStatus, dhDiscard, DH_CHANGE_EVENT } from '../bridge.ts'
 import { readDigitalHuman } from '../DigitalHumanToggle.tsx'
 import type { VoiceInjected } from '../contract.ts'
 import { cleanReplyText } from './clean.ts'
@@ -110,14 +110,11 @@ export const ReplySpeakerMount = memo(function ReplySpeakerMount({
   // key = user anchor, value = { timer, anchor } (the candidate's anchor).
   const dhLastDebounceRef = useRef(new Map<number, { timer: ReturnType<typeof setTimeout>; anchor: number }>())
   const LAST_DEBOUNCE_MS = 4000
-  // DH mode (wait-for-video instead of immediate TTS): resolved once from the
-  // bridge status (`enabled` + companion visible). null = not resolved yet.
-  const dhModeRef = useRef<boolean | null>(null)
-  // Whether the DH-mode resolution has completed (triggers re-render so the
-  // reply that arrived during the pending window is reprocessed with the
-  // correct dhMode — fixes the "TTS speaks first, then the video speaks the
-  // same reply again" double-play race).
-  const [dhResolved, setDhResolved] = useState(false)
+  // 桥接侧数字人开关（null = 尚未确认）。它现在**可以热切**：本地开关一翻，
+  // 插件会 POST /api/dh/enable，桥接状态变化后广播 DH_CHANGE_EVENT，这里重新
+  // 拉取——所以不能再像以前那样只在挂载时解析一次（关掉就再也回不来）。
+  // 确认前既不朗读也不提交视频，避免「同一回复先逐句 TTS、又被生成视频」双重播放。
+  const [bridgeDh, setBridgeDh] = useState<boolean | null>(null)
   // Code of the most recently submitted digital-human task (for discard).
   const lastDhCodeRef = useRef<string | null>(null)
   // Anchor of the last DH-submitted reply node; a later user node means the
@@ -142,6 +139,27 @@ export const ReplySpeakerMount = memo(function ReplySpeakerMount({
     dhLastDebounceRef.current.clear()
   }, [speaker, _registerTtsAbort])
 
+  // Track the BRIDGE-side digital-human switch (it can change at runtime): poll
+  // it on mount, and re-read it whenever the local toggle announces a change
+  // (the plugin POSTs /api/dh/enable first, so the bridge is already updated by
+  // the time we look). Bridge unreachable -> false, i.e. replies still speak
+  // through sentence TTS.
+  useEffect(() => {
+    let cancelled = false
+    const check = (): void => {
+      void dhStatus()
+        .then((s) => { if (!cancelled) setBridgeDh(s?.enabled === true) })
+        .catch(() => { if (!cancelled) setBridgeDh(false) })
+    }
+    check()
+    const onChange = (): void => { window.setTimeout(check, 200) }
+    window.addEventListener(DH_CHANGE_EVENT, onChange)
+    return () => {
+      cancelled = true
+      window.removeEventListener(DH_CHANGE_EVENT, onChange)
+    }
+  }, [])
+
   // Stream new complete sentences to TTS on every snapshot change. In digital
   // human mode the reply is NOT spoken immediately — its full text goes to the
   // bridge, which renders a lip-synced video (with the TTS audio embedded);
@@ -149,29 +167,11 @@ export const ReplySpeakerMount = memo(function ReplySpeakerMount({
   useEffect(() => {
     if (!voiceEnabled()) return
 
-    // Resolve the bridge DH availability once (config doesn't change at runtime);
-    // companion visibility + the digital-human toggle are RE-CHECKED every
-    // render so flipping the toggle mid-session takes effect immediately:
-    // turning the toggle OFF falls back to the near-instant sentence TTS.
-    if (dhModeRef.current === null) {
-      // DH 模式尚未确认：先不朗读也不提交视频，等 dhStatus 返回（或 3s 超时
-      // 兜底——桥接不可达时按非 DH 处理，回复仍会 TTS 朗读）。解析完成后
-      // setDhResolved 触发重渲染，等待窗口期到达的回复会按正确的 dhMode 处理，
-      // 避免「同一回复先被逐句 TTS 朗读、又被提交生成视频」的双重播放。
-      let settled = false
-      const finish = (enabled: boolean | null): void => {
-        if (settled) return
-        settled = true
-        if (dhModeRef.current === null) {
-          dhModeRef.current = enabled === true
-        }
-        setDhResolved(true)
-      }
-      void dhStatus().then((s) => finish(s?.enabled === true)).catch(() => finish(false))
-      setTimeout(() => finish(false), 3000)
-      return
-    }
-    const dhMode = dhModeRef.current === true && companionVisible() && readDigitalHuman()
+    // 桥接开关尚未确认：先不朗读也不提交视频，等 dhStatus 返回（桥接不可达时
+    // 按非 DH 处理，回复仍会 TTS 朗读）。确认后 setBridgeDh 触发重渲染，等待
+    // 窗口期到达的回复会按正确的 dhMode 处理。
+    if (bridgeDh === null) return
+    const dhMode = bridgeDh && companionVisible() && readDigitalHuman()
 
     // Barge-in swallowed the CURRENT reply: remember its exact anchor so only
     // that reply's remaining sentences are skipped; replies that appear
@@ -343,7 +343,7 @@ export const ReplySpeakerMount = memo(function ReplySpeakerMount({
       }),
       chainRef.current,
     )
-  }, [chat, speaker, _registerTtsAbort, dhResolved])
+  }, [chat, speaker, _registerTtsAbort, bridgeDh])
 
   return null
 })

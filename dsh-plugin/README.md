@@ -4,6 +4,20 @@
 
 > 💡 **推荐安装（rc.8 与 dsh 0.1.3 通用，免改源码）**：直接 `dsh plugin --profile web add github:beiyege-01/dsh-voice-ai-girlfriend-plugin` —— 独立插件包形态，2026-09-05 已在 **dsh v0.1.3-alpha.1** 实测通过。以下「xcopy 嵌入源码树」是 rc.8 时代的本地开发路线（需在 harness 内 `tsc -b` + tsdown 构建），rc.8 上仍然可用；升级到 0.1.3 时优先用上面的 plugin-add 路线。
 
+## 适配版本与维护节奏（2026-09-14）
+
+| 组件 | 适配版本 | 状态 |
+|---|---|---|
+| **DSH（主用）** | `dsh 0.1.3-alpha.1` / profile `web-v013`（:3080） | ✅ 实测通过 |
+| **DSH（兼容）** | `rc.8`（master `141eb6fef`）/ profile `web` | ✅ 仍可加载 |
+| 本插件 | `v0.3.0`（独立包仓库同版本） | `node build.mjs` → `lib/client.js` |
+| 语音桥接 | `bridge/voice_bridge.py`（FastAPI `:8765`，Python 3.14 venv） | 同仓库 |
+| TTS / 数字人 | OmniVoice（WSL2 + FlashInfer `:9877`）/ DUIX `trt10.9`（宿主 `:9000`） | 同仓库 |
+
+> `v0.3.0` 新增：数字人开关下沉到桥接（关＝桥接停手并可 `docker stop` 释放显存；开＝`docker start` + 就绪后预热）、生成中按钮绿色光环、卡片左下角分段进度（第 N/M 段）、语音总开关关闭时的显式提示。
+>
+> ⏳ **维护节奏**：作者本月筹备婚礼，DSH 新版本的适配与兼容跟进**顺延到国庆之后（10 月上旬）**。期间欢迎 issue / PR，响应可能较慢；上表版本功能完整可用。
+
 ## 它做了什么
 
 | 组件 | 功能 |

@@ -48,6 +48,41 @@
 └───────────────┘ └──────────────────────────┘
 ```
 
+## 一键全栈启动（推荐 · 2026-09-14 新增）
+
+重启电脑后只需要做两件事：**自己先打开 Docker Desktop**，然后**双击 `bridge/start-full-stack.cmd`**（也可拷到桌面建快捷方式）。脚本会按正确顺序把整条链路拉起来，最后打印一张自检表；浏览器会用带 token 的链接自动打开。
+
+| 步骤 | 做什么 | 幂等性 |
+|---|---|---|
+| 1/6 | 检查 Docker 引擎与 DUIX 容器；容器没起就 `docker start` 并等 `:9000` 应答 | 已在运行则跳过 |
+| 2/6 | 调用 `start-omnivoice-wsl.ps1`：起 WSL2 OmniVoice（`:9877`）+ 同步 bridge-config 的 IP + 拉起桥接（`:8765`） | 已在运行则跳过 |
+| 3/6 | 桥接保险：没起来就启动；缺 `DEEPSEEK_API_KEY` 时自动重启修复（余额徽章不再 503） | 幂等 |
+| 4/6 | 启动 DSH Web（默认新版 `0.1.3-alpha.1` / profile `web-v013`，`:3080`）并打开带 token 的链接 | 3080 已在服务则绝不打断现有会话 |
+| 5/6 | 数字人状态：开关 / 容器 / 段进度 / `submits`、`segment_submits` 计数 | 只读 |
+| 6/6 | 汇总自检表：每条链路 OK / FAIL | 只读 |
+
+参数：`-NoDsh`（只起语音栈）、`-Rc8`（改用旧版 rc.8 / profile `web`）、`-NoBrowser`、`-WithQQ`（额外拉起 NapCat）、`-SkipDockerCheck`。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File bridge\start-full-stack.ps1 -NoBrowser
+```
+
+## 版本适配与维护节奏（2026-09-14）
+
+| 组件 | 适配版本 |
+|---|---|
+| **DSH（主用）** | `dsh 0.1.3-alpha.1` / profile `web-v013`（`:3080`，桌面脚本「启动新版DSH-v013」） |
+| **DSH（兼容）** | `rc.8`（`E:\DSH\deepseek-harness` master `141eb6fef`）/ profile `web` |
+| 插件 | `@beiyege-01/dsh-voice-ai-girlfriend` **v0.3.0**（独立包仓库同步；`node build.mjs` 构建） |
+| 桥接 | `bridge/voice_bridge.py`（FastAPI/uvicorn `:8765`，Python 3.14 venv） |
+| TTS 引擎 | OmniVoice（WSL2 + FlashInfer，`:9877`） |
+| 数字人 | DUIX `guiji2025/duix.avatar-5090:trt10.9`（宿主 `:9000`，冷启动 1-3 分钟） |
+| Docker | Docker Desktop 29.x（DUIX 容器随「数字人开关」`docker start/stop`） |
+
+本轮桥接侧新增（v0.3.0 配套）：`POST /api/dh/enable` **运行时开关**（关掉＝清队列、停预热、零 DUIX 流量，并可联动 `docker stop` 释放显存；打开＝`docker start` + 就绪后预热）、轮转日志 `logs/bridge.log`、`/api/dh/status` 附带 `duix` 容器状态与 `stats` 计数（`submits` / `segment_submits` / `status_polls`，用于核对「任务到底提交了没有」）。
+
+⏳ **维护节奏：作者本月正在筹备婚礼，DSH 新版本的适配与兼容性跟进顺延到国庆之后（10 月上旬）。** 这段时间欢迎继续提 issue / PR，但响应可能会慢一些；上表所列版本功能完整、可正常使用。
+
 ## 目录结构
 
 ```
