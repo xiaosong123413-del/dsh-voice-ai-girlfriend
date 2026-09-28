@@ -42,6 +42,21 @@ class HttpProtocolTests(unittest.TestCase):
             self.assertEqual(self.client.get(route).status_code,401)
         with self.assertRaises(Exception):
             with self.client.websocket_connect("/voice/api/vad",headers=self.origin): pass
+    def test_login_form_preserves_same_origin_and_rejects_untrusted_origins(self):
+        page = self.client.get("/voice/login")
+        self.assertEqual(page.status_code, 200)
+        # no-referrer makes native form POST Origin null even on this same origin.
+        self.assertEqual(page.headers["Referrer-Policy"], "same-origin")
+        self.assertIn('form action="/voice/login" method="post"', page.text)
+        for origin in ("null", "https://untrusted.example"):
+            with self.subTest(origin=origin):
+                response = self.client.post("/voice/login",
+                    data={"password":"unit-test-only-password"},
+                    headers={"Origin":origin}, follow_redirects=False)
+                self.assertEqual(response.status_code, 403)
+                self.assertEqual(response.json()["error"], "origin_rejected")
+        self.login()
+
     def test_origin_and_cookie(self):
         self.assertEqual(self.client.post("/voice/login",data={"password":"unit-test-only-password"}).status_code,403)
         self.login()
