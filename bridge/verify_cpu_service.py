@@ -23,6 +23,7 @@ async def main(args):
  app=create_app(config)
  server=TestServer(uvicorn.Config(app,host="127.0.0.1",port=8765,access_log=False,log_level="error"))
  serving=asyncio.create_task(server.serve())
+ listener=None
  save()
  try:
   await asyncio.wait_for(server.listening.wait(),30)
@@ -49,6 +50,8 @@ async def main(args):
    import soundfile as sf
    import numpy as np
    waveform,rate=sf.read(str(args.sample))
+   if rate != 16000 or waveform.ndim != 1 or not len(waveform) or not np.isfinite(waveform).all():
+    raise ValueError("Acceptance sample must be nonempty finite mono 16 kHz audio")
    pcm=(np.clip(waveform,-1,1)*32767).astype("<i2").tobytes()
    capture=str(uuid.uuid4())
    first=(await client.post("/voice/api/stt?capture_id="+capture,content=pcm)).json()
@@ -91,6 +94,9 @@ async def main(args):
  except Exception as exc:
   report.update(status="FAIL",error_type=type(exc).__name__,error=str(exc))
  finally:
+  if listener:
+   listener.cancel()
+   await asyncio.gather(listener,return_exceptions=True)
   save();server.should_exit=True
   await serving
   report["closed"]=True;save()

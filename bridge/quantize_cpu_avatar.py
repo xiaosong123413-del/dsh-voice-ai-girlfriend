@@ -16,12 +16,14 @@ def main():
     parser.add_argument("--config",type=Path,required=True)
     parser.add_argument("--audio",type=Path,nargs="+",required=True)
     parser.add_argument("--output",type=Path,required=True)
+    parser.add_argument("--statistics", choices=["graph", "python"], default="graph")
     args=parser.parse_args()
     if args.output.exists():
         parser.error("Use a new output directory; never overwrite evidence")
     args.output.mkdir(parents=True)
     report={"status":"RUNNING","quality_accepted":False,"runtime_activated":False,
-            "scope":"experimental fixed-avatar calibration; not general face accuracy"}
+            "scope":"experimental fixed-avatar calibration; not general face accuracy",
+            "statistics_backend":args.statistics}
     def save(): (args.output/"summary.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
     save()
     try:
@@ -50,7 +52,9 @@ def main():
         started=time.perf_counter()
         compressed=nncf.quantize(graph,nncf.Dataset(calibration),
             subset_size=len(calibration),preset=nncf.QuantizationPreset.MIXED,
-            target_device=nncf.TargetDevice.CPU,fast_bias_correction=True)
+            target_device=nncf.TargetDevice.CPU,fast_bias_correction=True,
+            advanced_parameters=nncf.AdvancedQuantizationParameters(
+                inplace_statistics=args.statistics == "graph"))
         destination=args.output/"wav2lip-int8.xml"
         ov.save_model(compressed,destination,compress_to_fp16=False)
         # Held-out quality acceptance is separate; this measures conversion fidelity only.

@@ -1,4 +1,5 @@
 """Process-isolated, resident CPU models; worker calls never touch web state."""
+import hashlib
 import math
 import os
 import re
@@ -8,11 +9,29 @@ _MODEL = None
 _KIND = None
 _CONFIG = None
 _VADS = {}
+_VOICE_PROMPT = None
+_VOICE_SHA256 = None
+
+
+def prepare_voice(model, config):
+    """Encode one explicit reference once; never auto-transcribe or change voices."""
+    import soundfile as sf
+    audio = config.get("voice_reference_audio")
+    transcript = config.get("voice_reference_text", "").strip()
+    if not audio or not transcript:
+        raise ValueError("A voice reference WAV and its exact transcript are required")
+    path = Path(audio)
+    info = sf.info(path)
+    if not 0 < info.duration <= 20 or info.channels != 1:
+        raise ValueError("Voice reference must be nonempty mono audio, at most 20 seconds")
+    prompt = model.create_voice_clone_prompt(ref_audio=str(path), ref_text=transcript)
+    return prompt, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def initialize(kind, config):
-    global _MODEL, _KIND, _CONFIG
+    global _MODEL, _KIND, _CONFIG, _VOICE_PROMPT, _VOICE_SHA256
     _KIND, _CONFIG = kind, config
+    _VOICE_PROMPT, _VOICE_SHA256 = None, None
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     if kind == "avatar":
@@ -30,6 +49,7 @@ def initialize(kind, config):
             torch.backends.quantized.engine = "fbgemm"
             _MODEL = torch.ao.quantization.quantize_dynamic(
                 _MODEL, {torch.nn.Linear}, dtype=torch.qint8, inplace=True)
+        _VOICE_PROMPT, _VOICE_SHA256 = prepare_voice(_MODEL, config)
     elif kind == "asr":
         import sherpa_onnx
         root = Path(config["asr_models"])
@@ -45,7 +65,14 @@ def initialize(kind, config):
 def ready():
     if _MODEL is None:
         raise RuntimeError("Model not initialized")
-    return {"kind": _KIND, "device": "CPU", "pid": os.getpid()}
+    result = {"kind": _KIND, "device": "CPU", "pid": os.getpid()}
+    if _KIND == "tts":
+        if _VOICE_PROMPT is None:
+            raise RuntimeError("Voice reference not initialized")
+        result.update(voice_mode="reference", voice_sha256=_VOICE_SHA256)
+    elif _KIND == "avatar":
+        result.update(_MODEL.metadata)
+    return result
 
 
 def new_vad():
@@ -107,7 +134,9 @@ def synthesize(text, output):
     from omnivoice import OmniVoiceGenerationConfig
     if not text.strip() or len(text) > 24:
         raise ValueError("Invalid immutable TTS segment")
-    audio = _MODEL.generate(text=text, language="Chinese", instruct="female",
+    if _VOICE_PROMPT is None:
+        raise RuntimeError("Voice reference not initialized")
+    audio = _MODEL.generate(text=text, language="Chinese", voice_clone_prompt=_VOICE_PROMPT,
         normalize_text=False, generation_config=OmniVoiceGenerationConfig(
             num_step=_CONFIG.get("tts_steps", 16)))[0]
     destination = Path(output)

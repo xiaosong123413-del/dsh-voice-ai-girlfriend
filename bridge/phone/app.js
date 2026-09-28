@@ -8,6 +8,7 @@ let media = [], played = new Set(), ready = false, playing = null, activeVideo =
 let stream = null, context = null, worklet = null, socket = null, micGeneration = 0;
 let frames = [], recording = null, sent = 0, received = 0, uploading = false, lastRevision = -1;
 let assistantBubble = null, cancelPromise = Promise.resolve(), submission = 0;
+let startGeneration = 0, rejectStart = null;
 const otherVideo = () => activeVideo === el("video-a") ? el("video-b") : el("video-a");
 
 async function api(path, body, options = {}) {
@@ -43,7 +44,9 @@ function cancelCurrent(reason) {
   return cancelPromise;
 }
 async function stop(reason, message) {
-  started = false; submission++; source?.close(); source = null; stopMic();
+  started = false; submission++; startGeneration++;
+  rejectStart?.(new Error("Start cancelled")); rejectStart = null;
+  source?.close(); source = null; stopMic();
   el("start").disabled = false; el("end").disabled = true; el("mic").disabled = true;
   el("text").disabled = true; el("send").disabled = true;
   const task = cancelCurrent(reason);
@@ -232,21 +235,38 @@ el("mic").onclick = () => {
   else void startMic().catch((error) => { stopMic(); status("无法使用麦克风：" + error.message); });
 };
 el("start").onclick = async () => {
+  const attempt = ++startGeneration;
   el("start").disabled = true;
   try {
     const health = await api("health");
+    if (attempt !== startGeneration) return;
     if (health.status !== "ready") throw new Error(health.status === "loading" ? "云端模型正在加载，请稍后再点开始" : "云端初始化失败");
     if (document.hidden) throw new Error("页面已转到后台，请返回后重新开始");
     epoch = health.bridge_epoch; started = true; version++; lastRevision = -1; previous = null;
     source = new EventSource("/voice/api/events");
     await new Promise((resolve, reject) => {
-      source.onmessage = (event) => { const item = JSON.parse(event.data); applyEvent(item); if (item.event === "snapshot") resolve(); };
-      source.onerror = () => { reject(new Error("对话连接中断")); void stop("network_lost", "连接中断，请重新开始"); };
+      rejectStart = reject;
+      source.onmessage = (event) => {
+        if (attempt !== startGeneration) return;
+        const item = JSON.parse(event.data); applyEvent(item);
+        if (item.event === "snapshot") { rejectStart = null; resolve(); }
+      };
+      source.onerror = () => {
+        if (attempt !== startGeneration) return;
+        reject(new Error("对话连接中断")); void stop("network_lost", "连接中断，请重新开始");
+      };
     });
+    if (attempt !== startGeneration || !started) return;
     el("end").disabled = false; el("mic").disabled = false; el("text").disabled = false; el("send").disabled = false;
-    try { await startMic(); status("已开始，可以说话或发送文字"); }
-    catch { stopMic(); status("麦克风未获授权，可以发送文字或重新开启麦克风"); }
-  } catch (error) { started = false; el("start").disabled = false; status(error.message); }
+    try {
+      await startMic();
+      if (attempt === startGeneration && started) status("已开始，可以说话或发送文字");
+    } catch {
+      if (attempt === startGeneration && started) { stopMic(); status("麦克风未获授权，可以发送文字或重新开启麦克风"); }
+    }
+  } catch (error) {
+    if (attempt === startGeneration) { started = false; el("start").disabled = false; status(error.message); }
+  }
 };
 el("end").onclick = () => void stop("ended", "对话已结束");
 window.addEventListener("offline", () => void stop("network_lost", "网络已断开，请重新开始"));

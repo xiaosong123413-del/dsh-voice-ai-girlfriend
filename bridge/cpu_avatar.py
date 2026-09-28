@@ -42,9 +42,6 @@ class CpuAvatar:
         if config.get("avatar_precision") == "int8" and not quantized:
             raise ValueError("Configured INT8 avatar IR has no activation quantizers")
         graph.reshape({graph.inputs[0]: [self.batch, 1, 80, 16], graph.inputs[1]: [self.batch, 6, 96, 96]})
-        self.model = self.core.compile_model(graph, "CPU", {
-            "INFERENCE_NUM_THREADS": config.get("avatar_threads", 4), "NUM_STREAMS": 1,
-            "PERFORMANCE_HINT": "LATENCY", "INFERENCE_PRECISION_HINT": "f32"})
         frame = cv2.imread(config["avatar_image"])
         if frame is None:
             raise ValueError("Cannot read configured avatar image")
@@ -69,7 +66,19 @@ class CpuAvatar:
         masked = face.copy()
         masked[48:] = 0
         self.face_input = np.concatenate((masked, face), axis=2).transpose(2, 0, 1)[None].astype("float32") / 255
+        # The avatar is fixed for this resident worker. Bind it as a constant so
+        # OpenVINO can precompute the face encoder without changing FP32 values.
+        from openvino import opset13
+        face_parameter = graph.inputs[1].get_node()
+        fixed_face = opset13.constant(np.repeat(self.face_input, self.batch, axis=0))
+        face_parameter.output(0).replace(fixed_face.output(0))
+        graph.remove_parameter(face_parameter)
+        graph.validate_nodes_and_infer_types()
+        self.model = self.core.compile_model(graph, "CPU", {
+            "INFERENCE_NUM_THREADS": config.get("avatar_threads", 4), "NUM_STREAMS": 1,
+            "PERFORMANCE_HINT": "LATENCY", "INFERENCE_PRECISION_HINT": "f32"})
         self.metadata = {"backend": "original Wav2Lip/OpenVINO", "device": "CPU",
+                         "fixed_face": True,
                          "size": self.size, "fps": 25, "face_box": self.box, "batch": self.batch,
                          "graph_precision": "int8" if quantized else "fp32"}
 
@@ -110,7 +119,6 @@ class CpuAvatar:
         try:
             x1, y1, x2, y2 = self.box
             frame_count = math.ceil(duration * 25)
-            faces = self.np.repeat(self.face_input, self.batch, axis=0)
             for offset in range(0, frame_count, self.batch):
                 count = min(self.batch, frame_count-offset)
                 mel_frames = []
@@ -119,7 +127,7 @@ class CpuAvatar:
                     mel_start = min(int((part_index*2 + index/25)*80), mel.shape[1]-16)
                     mel_frames.append(mel[:, mel_start:mel_start+16])
                 audio_input = self.np.asarray(mel_frames, dtype="float32")[:, None]
-                prediction = self.model([audio_input, faces])[self.model.output(0)]
+                prediction = self.model([audio_input])[self.model.output(0)]
                 for item in range(count):
                     pixels = self.np.clip(prediction[item].transpose(1, 2, 0)*255, 0, 255).astype("uint8")
                     frame = self.frame.copy()

@@ -7,7 +7,7 @@ Status: core implementation and real cloud model chain verified; performance and
 Read the device page in the task-system knowledge base for machine-specific roots. Keep code, caches, temporary files and evidence in their approved roots. Do not reinstall DSH or copy its credentials. Model pins and measured failures are recorded in CPU_VALIDATION.md and the task evidence.
 
 1. Install requirements-cpu-service.txt into the existing CPU virtual environment using its uv and approved cache. The WebSocket package is required by both Uvicorn and acceptance clients.
-2. Create a task-local configuration from bridge/cpu_config.example.json. Replace every placeholder, set the real HTTPS origin and use a visually checked face box. Never put a password or API key in this JSON.
+2. Create a task-local configuration from bridge/cpu_config.example.json. Replace every placeholder, set the real HTTPS origin and use a visually checked face box. Set voice_reference_audio to a mono WAV (preferably 3–10 seconds, at most 20 seconds) and voice_reference_text to its exact transcript. The resident TTS worker encodes this voice once and reuses the same prompt for every segment; a missing reference is an error. No implicit ASR or fresh voice design runs per segment. Never put a password or API key in this JSON.
 3. Create a task-local Cordis overlay:
    ```yaml
    - insert:
@@ -29,7 +29,7 @@ The DSH plugin opens an ephemeral authenticated loopback cancel socket; its cred
 - speech_selection.py: streams the first readable assistant message; retains only the final committed candidate; rejects rewritten spoken prefixes; flushes the short final tail.
 - dsh_bridge.py and dsh_stream_plugin.mjs: real SDK requests, live assistant-stream frames, durable assistant/message and turn/end, owned-session cancellation.
 - cpu_workers.py/cpu_runtime.py: one resident process per model, explicit CPU thread budgets, one TTS generation per immutable segment, bounded overlap with rendering, cancellation checks before/after atomic inference.
-- cpu_avatar.py: original non-GAN Wav2Lip compiled once with OpenVINO CPU; cached image/face, batched inference, 25 fps H.264/AAC MP4, two-second parts and intact tails, atomic publish.
+- cpu_avatar.py: original non-GAN Wav2Lip compiled once with OpenVINO CPU; a constant FP32 face input (encoder work can be precomputed), batched inference, 25 fps H.264/AAC MP4, two-second parts and intact tails, atomic publish.
 - cpu_server.py: cookie authentication, same-origin mutation/WS checks, protected API/SSE/media/Range; no public docs or management routes.
 - phone/: actual recording worklet, 16 kHz PCM, voice endpointing, bounded preroll, shared media queue, user-gesture start, mic/end separation, disconnection/background stop.
 
@@ -37,12 +37,12 @@ The DSH plugin opens an ephemeral authenticated loopback cancel socket; its cred
 
 From bridge with the CPU Python:
 ```text
-python -m unittest test_reply_protocol test_speech_selection test_cpu_server test_cpu_runtime test_dsh_bridge test_evaluate_acceptance -v
-node --test phone/test_capture.cjs
+python -m unittest test_reply_protocol test_speech_selection test_cpu_server test_cpu_runtime test_dsh_bridge test_evaluate_acceptance test_cpu_voice -v
+node --test phone/test_capture.cjs phone/test_interaction.cjs
 node --check phone/app.js
 ```
 
-29 Python tests and 3 worklet sample-rate tests passed on 2026-09-28. FakeRuntime in unit tests is explicitly a test double; it is never a production fallback. Real evidence is separate:
+32 Python tests, 3 worklet sample-rate tests and 7 simulated-browser interaction tests passed on 2026-09-28. Interaction tests include interrupted startup, old playback promises, duplicate media, End and backgrounding; they are not a real browser or phone test. FakeRuntime in unit tests is explicitly a test double; it is never a production fallback. Real evidence is separate:
 - dsh-sdk-smoke-02.json: native API stream and completed durable turn.
 - dsh-adapter-01.json: one actual response submitted once to the reply protocol.
 - runtime-smoke-01.json: real ASR/VAD plus DSH→OmniVoice→Wav2Lip, 2.00+0.04 second media, first media 28.962 seconds, total 30.768 seconds, orderly shutdown.
@@ -51,6 +51,11 @@ node --check phone/app.js
 - verify_cpu_service.py --config <task config> --sample <real 16k mono WAV> --output <new evidence directory>: repeatable repository version of the real HTTP probe. It starts an isolated local service with an in-memory test credential, exercises real models/API, then shuts down. Port 8765 must be free; do not stop unrelated listeners.
 - evaluate_acceptance.py <phone-run.json> --output <new report.json>: nearest-rank twenty-turn latency evaluation; missing audible evidence, failed turns, duplicate IDs and non-phone cohorts fail. This evaluator does not replace human review of the evidence.
 
+- http-service-repo-03/summary.json: repository probe PASS, all ten real HTTP/WS/SSE/model checks, 32.446 seconds to complete, owned service closed.
+- http-service-repo-04/summary.json: latest fixed-reference voice plus FP32 constant-face implementation passed all ten real HTTP checks and closed normally. Reply audio was 3.16 seconds; full generation took 49.027 seconds. This is a functional PASS and a performance FAIL, not a phone latency measurement.
+- voice-reference-01.json: two real OmniVoice segments reused one encoded generated-demo voice reference; 30.011/32.213 seconds for 2.16/2.32 seconds of audio. Voice consistency/listening are not human-accepted.
+- avatar-frozen-equivalence-07.json: fixed-face FP32 output equals baseline element-for-element on six batches from two new audio samples (maximum absolute error zero).
+- benchmark_cpu_avatar.py --config <task config> --audio <WAV> --output <new evidence directory>: real rendering/encoding and warm throughput checks. avatar-repo-08 generated all parts, but its throughput gate failed: 3.988–4.119 seconds per 2.16 seconds of audio. The script keeps generation and performance results separate.
 - dsh-resume-01.json: actual native session resume across two separate DSH subprocesses; the second process correctly recalled the flower name supplied in the first, without speaking historical turns.
 
 These tests do not prove a five-to-ten-second audible phone response. CPU throughput remains below playback rate. INT8 and 16 steps require listening-quality acceptance. Real phone permissions, 20-turn P95, long playback gaps/AV drift, external-speaker echo, five interruptions and 20 human ASR recordings remain unverified.
@@ -59,7 +64,7 @@ These tests do not prove a five-to-ten-second audible phone response. CPU throug
 
 quantize_cpu_avatar.py uses the [official NNCF calibration flow](https://docs.openvino.ai/2024/openvino-workflow/model-optimization-guide/quantizing-models-post-training/basic-quantization-flow.html) on the fixed original Wav2Lip graph. Install requirements-cpu-optimization.txt only for this experiment. Supply a new output directory and representative WAV inputs; preserve the FP32 IR. Calibration-set MAE is not held-out accuracy. The script does not change the runtime configuration. Set avatar_precision=int8 only after validating a generated IR; a missing INT8 IR is an explicit error, never a silent FP32 replacement.
 
-The TTS CLI also accepts experimental eight-step sampling. The measured eight-step cases took 10.029/10.778 seconds for 2.16 seconds of audio. Listening and sustained-throughput gates remain unpassed; serving still defaults to sixteen steps. The first NNCF experiment failed on Windows GBK progress output; UTF-8 output was fixed and the failed evidence retained.
+The TTS CLI also accepts experimental eight-step sampling. The measured eight-step cases took 10.029/10.778 seconds for 2.16 seconds of audio. Listening and sustained-throughput gates remain unpassed; serving still defaults to sixteen steps. The first NNCF experiment failed on Windows GBK progress output; UTF-8 output was fixed and the failed evidence retained. NNCF graph-statistics compilation then crashed in native OpenVINO (0xc0000005); --statistics python used the public Python-statistics option and successfully produced an experimental IR. Three renders passed technically, with warm two-second parts taking 2.125/2.293 seconds, but visual comparison showed color blocks and neck artifacts. This INT8 avatar is rejected and NOT activated. Serving retains FP32 plus the numerically verified fixed-face optimization.
 
 ## Detailed phone acceptance
 

@@ -10,6 +10,8 @@
   "tts_threads": 8,
   "tts_precision": "int8",
   "tts_steps": 16,
+  "voice_reference_audio": "<mono reference WAV, preferably 3-10 seconds>",
+  "voice_reference_text": "<exact reference transcript>",
   "wav2lip_source": "<pinned original Wav2Lip source>",
   "wav2lip_weights": "<original non-GAN wav2lip.pth>",
   "avatar_ir": "<task cache>/openvino-fp32.xml",

@@ -56,6 +56,24 @@ function browser() {
   return {get,requests,plays,sources,events,sandbox,emit,start,send};
 }
 
+test("offline during delayed health never restarts capture",async()=>{
+ const b=browser();const original=b.sandbox.fetch;let release;
+ b.sandbox.fetch=(url,options)=>url.endsWith("/health")?new Promise(resolve=>{release=async()=>resolve(await original(url,options));}):original(url,options);
+ const pending=b.start();b.events.offline();await release();await pending;
+ assert.equal(b.sources.length,0);
+ assert.equal(b.get("text").disabled,true);
+ assert.equal(b.get("start").disabled,false);
+});
+test("end while snapshot is pending settles start and ignores late snapshot",async()=>{
+ const b=browser();
+ b.sandbox.EventSource=class{constructor(){b.sources.push(this);}close(){this.closed=true;}};
+ const pending=b.start();await Promise.resolve();await Promise.resolve();await Promise.resolve();
+ while (!b.sources.length) await Promise.resolve();
+ b.get("end").onclick();await pending;
+ b.sources[0].onmessage({data:JSON.stringify({event:"snapshot",revision:0,bridge_epoch:"epoch",active:{}})});
+ assert.equal(b.get("text").disabled,true);
+ assert.equal(b.sources[0].closed,true);
+});
 test("start never speaks snapshots or submits a historical prompt",async()=>{
  const b=browser();await b.start();
  assert.equal(b.plays.length,0);
