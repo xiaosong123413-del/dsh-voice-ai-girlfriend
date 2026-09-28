@@ -1,0 +1,2 @@
+# Optional offline calibration only. Never needed for serving an existing IR.
+nncf==3.2.0

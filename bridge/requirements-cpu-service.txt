@@ -1,0 +1,5 @@
+# Install into the existing pinned CPU model environment; see docs/CPU_SERVICE.md.
+fastapi==0.141.1
+uvicorn==0.54.0
+httpx==0.28.1
+websockets==15.0.1
