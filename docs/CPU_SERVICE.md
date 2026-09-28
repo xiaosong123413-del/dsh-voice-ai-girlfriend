@@ -66,6 +66,14 @@ quantize_cpu_avatar.py uses the [official NNCF calibration flow](https://docs.op
 
 The TTS CLI also accepts experimental eight-step sampling. The measured eight-step cases took 10.029/10.778 seconds for 2.16 seconds of audio. Listening and sustained-throughput gates remain unpassed; serving still defaults to sixteen steps. The first NNCF experiment failed on Windows GBK progress output; UTF-8 output was fixed and the failed evidence retained. NNCF graph-statistics compilation then crashed in native OpenVINO (0xc0000005); --statistics python used the public Python-statistics option and successfully produced an experimental IR. Three renders passed technically, with warm two-second parts taking 2.125/2.293 seconds, but visual comparison showed color blocks and neck artifacts. This INT8 avatar is rejected and NOT activated. Serving retains FP32 plus the numerically verified fixed-face optimization.
 
+## Public HTTPS verification
+
+Run `verify_public_service.py --origin https://<hostname> --output <new report.json>` with AI_COMPANION_PASSWORD privately supplied in its process environment. It tests the existing service and leaves it running. Run before user handoff: logging in revokes the previous app cookie. The probe generates one real DSH/model reply, then cancels it; it never prints the password or cookie.
+
+The dedicated Cloudflare deployment passed twelve public checks in public-https-01.json: login, private endpoints, secure cookie, same-origin enforcement, WebSocket, unbuffered SSE with real media, byte ranges, no caching, cancellation and denied cancelled media. First file notification was 38.205 seconds; this is not actual audible phone timing. A separate desktop HTTPS login/health check returned 303/200 and ready using the encrypted credential without displaying it.
+
+Deployment-specific hostname, task paths and encrypted-credential ownership live on the task-system device page. Windows logon tasks were registered for the existing Administrator profile; a reboot without that profile logging in is not a verified unattended startup. Never run another connector with a different ingress configuration under the same tunnel ID. The AI companion uses its own named tunnel.
+
 ## Detailed phone acceptance
 
 Use the project acceptance matrix/spec as the normative thresholds. For each run record a fresh run ID, commit, model hashes, config excluding credentials, phone/browser/OS, network, asset, timestamps and raw observed outcome.
